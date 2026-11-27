@@ -3,13 +3,26 @@ import os
 import pickle
 import threading
 
-import av
 import cv2
 import numpy as np
 import streamlit as st
 import tensorflow as tf
 from PIL import Image
-from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, WebRtcMode, webrtc_streamer
+
+try:
+    import av
+    from streamlit_webrtc import (
+        RTCConfiguration,
+        VideoProcessorBase,
+        WebRtcMode,
+        webrtc_streamer,
+    )
+
+    WEBRTC_AVAILABLE = True
+    WEBRTC_IMPORT_ERROR = None
+except Exception as exc:
+    WEBRTC_AVAILABLE = False
+    WEBRTC_IMPORT_ERROR = str(exc)
 
 # Configuración de la página
 st.set_page_config(
@@ -31,10 +44,6 @@ CLASS_LABELS_ES = {
     "men": "Hombre",
     "women": "Mujer",
 }
-
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
 
 
 @st.cache_resource
@@ -60,7 +69,6 @@ def load_gender_model():
         model.set_weights(data["weights"])
         return model
 
-    # Respaldo por si en el futuro se guarda un modelo directo
     return data
 
 
@@ -70,19 +78,25 @@ def load_face_detector():
     return cv2.CascadeClassifier(cascade_path)
 
 
-def preprocess_image(rgb_image: np.ndarray, target_size=(224, 224), mode: str = "mobilenet_v2") -> np.ndarray:
+def preprocess_image(
+    rgb_image: np.ndarray, target_size=(224, 224), mode: str = "mobilenet_v2"
+) -> np.ndarray:
     resized = cv2.resize(rgb_image, target_size, interpolation=cv2.INTER_AREA)
     arr = resized.astype(np.float32)
     if mode == "mobilenet_v2":
-        # Escala de [0, 255] a [-1, 1]
         arr = tf.keras.applications.mobilenet_v2.preprocess_input(arr)
     else:
-        # Escala de [0, 255] a [0, 1]
         arr = arr / 255.0
     return np.expand_dims(arr, axis=0)
 
 
-def predict_gender(model, rgb_crop: np.ndarray, classes_map: dict, input_size=(224, 224), preprocess_mode="mobilenet_v2"):
+def predict_gender(
+    model,
+    rgb_crop: np.ndarray,
+    classes_map: dict,
+    input_size=(224, 224),
+    preprocess_mode="mobilenet_v2",
+):
     batch = preprocess_image(rgb_crop, target_size=input_size, mode=preprocess_mode)
     prob_class_1 = float(model.predict(batch, verbose=0)[0][0])
 
@@ -97,100 +111,121 @@ def predict_gender(model, rgb_crop: np.ndarray, classes_map: dict, input_size=(2
     return label_es, confidence, prob_class_1
 
 
-class GenderVideoProcessor(VideoProcessorBase):
-    def __init__(self, model, face_cascade, classes_map, input_size, preprocess_mode, detect_faces):
-        self.model = model
-        self.face_cascade = face_cascade
-        self.classes_map = classes_map
-        self.input_size = input_size
-        self.preprocess_mode = preprocess_mode
-        self.detect_faces = detect_faces
-        self.lock = threading.Lock()
-        self.latest_result = None
+if WEBRTC_AVAILABLE:
+    RTC_CONFIGURATION = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
 
-    def update_settings(self, preprocess_mode: str, detect_faces: bool):
-        with self.lock:
+    class GenderVideoProcessor(VideoProcessorBase):
+        def __init__(
+            self,
+            model,
+            face_cascade,
+            classes_map,
+            input_size,
+            preprocess_mode,
+            detect_faces,
+        ):
+            self.model = model
+            self.face_cascade = face_cascade
+            self.classes_map = classes_map
+            self.input_size = input_size
             self.preprocess_mode = preprocess_mode
             self.detect_faces = detect_faces
+            self.lock = threading.Lock()
+            self.latest_result = None
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img_bgr = frame.to_ndarray(format="bgr24")
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        def update_settings(self, preprocess_mode: str, detect_faces: bool):
+            with self.lock:
+                self.preprocess_mode = preprocess_mode
+                self.detect_faces = detect_faces
 
-        with self.lock:
-            preprocess_mode = self.preprocess_mode
-            detect_faces = self.detect_faces
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            img_bgr = frame.to_ndarray(format="bgr24")
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        results_summary = []
+            with self.lock:
+                preprocess_mode = self.preprocess_mode
+                detect_faces = self.detect_faces
 
-        if detect_faces:
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            faces = self.face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=(60, 60),
-            )
-        else:
-            faces = []
+            results_summary = []
 
-        if len(faces) > 0:
-            for (x, y, w, h) in faces:
-                # Añadir un pequeño margen alrededor del rostro
-                pad_w = int(w * 0.15)
-                pad_h = int(h * 0.15)
-                x1 = max(0, x - pad_w)
-                y1 = max(0, y - pad_h)
-                x2 = min(img_rgb.shape[1], x + w + pad_w)
-                y2 = min(img_rgb.shape[0], y + h + pad_h)
+            if detect_faces:
+                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                faces = self.face_cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(60, 60),
+                )
+            else:
+                faces = []
 
-                face_crop = img_rgb[y1:y2, x1:x2]
-                if face_crop.size == 0:
-                    continue
+            if len(faces) > 0:
+                for (x, y, w, h) in faces:
+                    pad_w = int(w * 0.15)
+                    pad_h = int(h * 0.15)
+                    x1 = max(0, x - pad_w)
+                    y1 = max(0, y - pad_h)
+                    x2 = min(img_rgb.shape[1], x + w + pad_w)
+                    y2 = min(img_rgb.shape[0], y + h + pad_h)
 
+                    face_crop = img_rgb[y1:y2, x1:x2]
+                    if face_crop.size == 0:
+                        continue
+
+                    label_es, conf, prob_1 = predict_gender(
+                        self.model,
+                        face_crop,
+                        self.classes_map,
+                        self.input_size,
+                        preprocess_mode,
+                    )
+                    color = (255, 105, 180) if label_es == "Mujer" else (0, 191, 255)
+                    text = f"{label_es}: {conf * 100:.1f}%"
+
+                    cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
+                    cv2.rectangle(
+                        img_bgr, (x1, max(0, y1 - 30)), (x1 + 210, y1), color, -1
+                    )
+                    cv2.putText(
+                        img_bgr,
+                        text,
+                        (x1 + 6, max(20, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    results_summary.append((label_es, conf, prob_1))
+            else:
                 label_es, conf, prob_1 = predict_gender(
-                    self.model, face_crop, self.classes_map, self.input_size, preprocess_mode
+                    self.model,
+                    img_rgb,
+                    self.classes_map,
+                    self.input_size,
+                    preprocess_mode,
                 )
                 color = (255, 105, 180) if label_es == "Mujer" else (0, 191, 255)
-                text = f"{label_es}: {conf * 100:.1f}%"
-
-                cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
-                cv2.rectangle(img_bgr, (x1, max(0, y1 - 30)), (x1 + 210, y1), color, -1)
+                text = f"{label_es} ({conf * 100:.1f}%)"
+                cv2.rectangle(img_bgr, (10, 10), (290, 50), (20, 20, 20), -1)
                 cv2.putText(
                     img_bgr,
                     text,
-                    (x1 + 6, max(20, y1 - 8)),
+                    (20, 38),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (255, 255, 255),
+                    0.8,
+                    color,
                     2,
                     cv2.LINE_AA,
                 )
                 results_summary.append((label_es, conf, prob_1))
-        else:
-            # Si no se detectan rostros o el modo rostro está desactivado, evaluar el cuadro completo
-            label_es, conf, prob_1 = predict_gender(
-                self.model, img_rgb, self.classes_map, self.input_size, preprocess_mode
-            )
-            color = (255, 105, 180) if label_es == "Mujer" else (0, 191, 255)
-            text = f"{label_es} ({conf * 100:.1f}%)"
-            cv2.rectangle(img_bgr, (10, 10), (290, 50), (20, 20, 20), -1)
-            cv2.putText(
-                img_bgr,
-                text,
-                (20, 38),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
-            results_summary.append((label_es, conf, prob_1))
 
-        with self.lock:
-            self.latest_result = results_summary
+            with self.lock:
+                self.latest_result = results_summary
 
-        return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
+            return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
 
 
 def main():
@@ -212,7 +247,6 @@ def main():
     input_shape = metadata.get("input_shape", [224, 224, 3])
     input_size = (int(input_shape[1]), int(input_shape[0]))
 
-    # Barra lateral con configuración e información del modelo
     with st.sidebar:
         st.header("⚙️ Configuración")
         detect_faces = st.checkbox(
@@ -226,7 +260,9 @@ def main():
             index=0,
             help="Usa [-1, 1] si entrenaste con preprocess_input de MobileNetV2, o [0, 1] si usaste rescale=1./255.",
         )
-        preprocess_mode = "mobilenet_v2" if "MobileNetV2" in preprocess_label else "rescale_01"
+        preprocess_mode = (
+            "mobilenet_v2" if "MobileNetV2" in preprocess_label else "rescale_01"
+        )
 
         st.divider()
         st.subheader("📊 Detalles del modelo")
@@ -243,29 +279,38 @@ def main():
     tab_live, tab_photo = st.tabs(["📹 Cámara en Tiempo Real", "📸 Captura o Imagen"])
 
     with tab_live:
-        st.info(
-            "Haz clic en **START** para encender tu cámara y permitir el acceso en el navegador."
-        )
-        ctx = webrtc_streamer(
-            key="gender-detection-live",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIGURATION,
-            video_processor_factory=lambda: GenderVideoProcessor(
-                model=model,
-                face_cascade=face_cascade,
-                classes_map=classes_map,
-                input_size=input_size,
-                preprocess_mode=preprocess_mode,
-                detect_faces=detect_faces,
-            ),
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
+        if WEBRTC_AVAILABLE:
+            st.info(
+                "Haz clic en **START** para encender tu cámara y permitir el acceso en el navegador."
+            )
+            ctx = webrtc_streamer(
+                key="gender-detection-live",
+                mode=WebRtcMode.SENDRECV,
+                rtc_configuration=RTC_CONFIGURATION,
+                video_processor_factory=lambda: GenderVideoProcessor(
+                    model=model,
+                    face_cascade=face_cascade,
+                    classes_map=classes_map,
+                    input_size=input_size,
+                    preprocess_mode=preprocess_mode,
+                    detect_faces=detect_faces,
+                ),
+                media_stream_constraints={"video": True, "audio": False},
+                async_processing=True,
+            )
 
-        if ctx.video_processor:
-            ctx.video_processor.update_settings(
-                preprocess_mode=preprocess_mode,
-                detect_faces=detect_faces,
+            if ctx.video_processor:
+                ctx.video_processor.update_settings(
+                    preprocess_mode=preprocess_mode,
+                    detect_faces=detect_faces,
+                )
+        else:
+            st.warning(
+                "El streaming en tiempo real (`streamlit-webrtc` / `av`) no está disponible "
+                f"en este entorno ({WEBRTC_IMPORT_ERROR}). "
+                "Verifica que `requirements.txt` y `packages.txt` estén en la raíz del repositorio "
+                "y reinicia la app desde **Manage app → Reboot app**. "
+                "Mientras tanto, puedes usar la pestaña **📸 Captura o Imagen**."
             )
 
     with tab_photo:
