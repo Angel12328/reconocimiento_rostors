@@ -3,11 +3,15 @@ import os
 import pickle
 import threading
 
-import cv2
 import numpy as np
 import streamlit as st
 import tensorflow as tf
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 try:
     import av
@@ -74,15 +78,24 @@ def load_gender_model():
 
 @st.cache_resource
 def load_face_detector():
+    if cv2 is None:
+        return None
+    if not hasattr(cv2, "CascadeClassifier") or not hasattr(cv2, "data"):
+        return None
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    return cv2.CascadeClassifier(cascade_path)
+    if not os.path.exists(cascade_path):
+        return None
+    detector = cv2.CascadeClassifier(cascade_path)
+    if detector.empty():
+        return None
+    return detector
 
 
 def preprocess_image(
     rgb_image: np.ndarray, target_size=(224, 224), mode: str = "mobilenet_v2"
 ) -> np.ndarray:
-    resized = cv2.resize(rgb_image, target_size, interpolation=cv2.INTER_AREA)
-    arr = resized.astype(np.float32)
+    pil_img = Image.fromarray(rgb_image).resize(target_size, Image.Resampling.BILINEAR)
+    arr = np.asarray(pil_img, dtype=np.float32)
     if mode == "mobilenet_v2":
         arr = tf.keras.applications.mobilenet_v2.preprocess_input(arr)
     else:
@@ -111,6 +124,19 @@ def predict_gender(
     return label_es, confidence, prob_class_1
 
 
+def detect_faces_rgb(face_cascade, img_rgb: np.ndarray):
+    if face_cascade is None:
+        return []
+    gray = np.asarray(Image.fromarray(img_rgb).convert("L"))
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(60, 60),
+    )
+    return faces if len(faces) > 0 else []
+
+
 if WEBRTC_AVAILABLE:
     RTC_CONFIGURATION = RTCConfiguration(
         {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
@@ -134,6 +160,7 @@ if WEBRTC_AVAILABLE:
             self.detect_faces = detect_faces
             self.lock = threading.Lock()
             self.latest_result = None
+            self.font = ImageFont.load_default()
 
         def update_settings(self, preprocess_mode: str, detect_faces: bool):
             with self.lock:
@@ -141,34 +168,30 @@ if WEBRTC_AVAILABLE:
                 self.detect_faces = detect_faces
 
         def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-            img_bgr = frame.to_ndarray(format="bgr24")
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            img_rgb = frame.to_ndarray(format="rgb24")
 
             with self.lock:
                 preprocess_mode = self.preprocess_mode
                 detect_faces = self.detect_faces
 
-            results_summary = []
+            faces = (
+                detect_faces_rgb(self.face_cascade, img_rgb)
+                if detect_faces
+                else []
+            )
 
-            if detect_faces:
-                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-                faces = self.face_cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=(60, 60),
-                )
-            else:
-                faces = []
+            pil_canvas = Image.fromarray(img_rgb)
+            draw = ImageDraw.Draw(pil_canvas)
+            results_summary = []
 
             if len(faces) > 0:
                 for (x, y, w, h) in faces:
                     pad_w = int(w * 0.15)
                     pad_h = int(h * 0.15)
-                    x1 = max(0, x - pad_w)
-                    y1 = max(0, y - pad_h)
-                    x2 = min(img_rgb.shape[1], x + w + pad_w)
-                    y2 = min(img_rgb.shape[0], y + h + pad_h)
+                    x1 = max(0, int(x) - pad_w)
+                    y1 = max(0, int(y) - pad_h)
+                    x2 = min(img_rgb.shape[1], int(x + w) + pad_w)
+                    y2 = min(img_rgb.shape[0], int(y + h) + pad_h)
 
                     face_crop = img_rgb[y1:y2, x1:x2]
                     if face_crop.size == 0:
@@ -184,19 +207,14 @@ if WEBRTC_AVAILABLE:
                     color = (255, 105, 180) if label_es == "Mujer" else (0, 191, 255)
                     text = f"{label_es}: {conf * 100:.1f}%"
 
-                    cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
-                    cv2.rectangle(
-                        img_bgr, (x1, max(0, y1 - 30)), (x1 + 210, y1), color, -1
-                    )
-                    cv2.putText(
-                        img_bgr,
+                    draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+                    label_top = max(0, y1 - 22)
+                    draw.rectangle([x1, label_top, x1 + 140, y1], fill=color)
+                    draw.text(
+                        (x1 + 6, label_top + 4),
                         text,
-                        (x1 + 6, max(20, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
+                        fill=(255, 255, 255),
+                        font=self.font,
                     )
                     results_summary.append((label_es, conf, prob_1))
             else:
@@ -209,23 +227,15 @@ if WEBRTC_AVAILABLE:
                 )
                 color = (255, 105, 180) if label_es == "Mujer" else (0, 191, 255)
                 text = f"{label_es} ({conf * 100:.1f}%)"
-                cv2.rectangle(img_bgr, (10, 10), (290, 50), (20, 20, 20), -1)
-                cv2.putText(
-                    img_bgr,
-                    text,
-                    (20, 38),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    color,
-                    2,
-                    cv2.LINE_AA,
-                )
+                draw.rectangle([10, 10, 210, 42], fill=(20, 20, 20))
+                draw.text((18, 20), text, fill=color, font=self.font)
                 results_summary.append((label_es, conf, prob_1))
 
             with self.lock:
                 self.latest_result = results_summary
 
-            return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
+            annotated_rgb = np.asarray(pil_canvas)
+            return av.VideoFrame.from_ndarray(annotated_rgb, format="rgb24")
 
 
 def main():
@@ -251,8 +261,13 @@ def main():
         st.header("⚙️ Configuración")
         detect_faces = st.checkbox(
             "Detectar rostro automáticamente",
-            value=True,
-            help="Recorta el rostro detectado antes de enviarlo al modelo. Si no detecta ninguno, evalúa toda la imagen.",
+            value=face_cascade is not None,
+            disabled=face_cascade is None,
+            help=(
+                "Recorta el rostro detectado antes de enviarlo al modelo."
+                if face_cascade is not None
+                else "Detector facial de OpenCV no disponible en este entorno; se analizará el cuadro completo."
+            ),
         )
         preprocess_label = st.radio(
             "Preprocesamiento de imagen",
@@ -308,8 +323,6 @@ def main():
             st.warning(
                 "El streaming en tiempo real (`streamlit-webrtc` / `av`) no está disponible "
                 f"en este entorno ({WEBRTC_IMPORT_ERROR}). "
-                "Verifica que `requirements.txt` y `packages.txt` estén en la raíz del repositorio "
-                "y reinicia la app desde **Manage app → Reboot app**. "
                 "Mientras tanto, puedes usar la pestaña **📸 Captura o Imagen**."
             )
 
@@ -325,12 +338,11 @@ def main():
         source_file = cam_photo if cam_photo is not None else uploaded_file
         if source_file is not None:
             image = Image.open(source_file).convert("RGB")
-            img_rgb = np.array(image)
+            img_rgb = np.asarray(image)
 
             crop_to_predict = img_rgb
-            if detect_faces:
-                gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-                faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
+            if detect_faces and face_cascade is not None:
+                faces = detect_faces_rgb(face_cascade, img_rgb)
                 if len(faces) > 0:
                     x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
                     crop_to_predict = img_rgb[y : y + h, x : x + w]
