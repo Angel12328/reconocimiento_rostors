@@ -58,6 +58,20 @@ def load_metadata() -> dict:
     return DEFAULT_METADATA
 
 
+def build_mobilenetv2_gender_model(input_shape=(224, 224, 3)):
+    inputs = tf.keras.Input(shape=tuple(input_shape))
+    base_model = tf.keras.applications.MobileNetV2(
+        input_shape=tuple(input_shape),
+        include_top=False,
+        weights=None,
+    )
+    x = base_model(inputs)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
+    return tf.keras.Model(inputs=inputs, outputs=outputs)
+
+
 @st.cache_resource
 def load_gender_model():
     if not os.path.exists(MODEL_PATH):
@@ -67,11 +81,22 @@ def load_gender_model():
     with open(MODEL_PATH, "rb") as f:
         data = pickle.load(f)
 
-    # El archivo .pkl contiene {'weights': [...], 'config': {...}} de Keras 3
-    if isinstance(data, dict) and "config" in data and "weights" in data:
-        model = tf.keras.Sequential.from_config(data["config"])
-        model.set_weights(data["weights"])
-        return model
+    if isinstance(data, dict) and "weights" in data:
+        weights = data["weights"]
+        # Reconstrucción directa con Functional API para evitar errores de Sequential.build en Keras 3
+        model = build_mobilenetv2_gender_model((224, 224, 3))
+        if len(model.weights) == len(weights):
+            model.set_weights(weights)
+            # Inicializar grafo de inferencia
+            _ = model(np.zeros((1, 224, 224, 3), dtype=np.float32), training=False)
+            return model
+
+        # Respaldo con config si cambia la arquitectura
+        if "config" in data:
+            model = tf.keras.Sequential.from_config(data["config"])
+            model.set_weights(weights)
+            _ = model(np.zeros((1, 224, 224, 3), dtype=np.float32), training=False)
+            return model
 
     return data
 
@@ -111,7 +136,8 @@ def predict_gender(
     preprocess_mode="mobilenet_v2",
 ):
     batch = preprocess_image(rgb_crop, target_size=input_size, mode=preprocess_mode)
-    prob_class_1 = float(model.predict(batch, verbose=0)[0][0])
+    preds = model(batch, training=False)
+    prob_class_1 = float(np.asarray(preds)[0][0])
 
     if prob_class_1 >= 0.5:
         raw_label = classes_map.get("1", "women")
@@ -360,3 +386,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
