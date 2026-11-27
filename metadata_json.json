@@ -1,0 +1,20 @@
+{
+    "model_type": "MobileNetV2 Transfer Learning",
+    "input_shape": [
+        224,
+        224,
+        3
+    ],
+    "classes": {
+        "0": "men",
+        "1": "women"
+    },
+    "training_summary": {
+        "epochs": 10,
+        "batch_size": 32,
+        "final_training_accuracy": 0.65625,
+        "final_validation_accuracy": 0.640625,
+        "final_training_loss": 0.5684124827384949,
+        "final_validation_loss": 0.6096839904785156
+    }
+}
